@@ -1,0 +1,2023 @@
+; ----------------------------------------------------------------
+;  VORTEX — external overlay for Roblox
+;  ESP / aimbot / silent aim / world tweaks
+;
+;  Offsets auto-fetch from theo's dump; falls back to offsets.txt
+;  next to the script, then to built-in defaults.
+;
+;  F4 overlay    F5 rescan    F6 debug    F7 report    End exit
+; ----------------------------------------------------------------
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+DllCall("user32\SetProcessDPIAware")
+
+if (!A_IsAdmin) {
+    relaunch := A_IsCompiled ? '"' A_ScriptFullPath '"'
+                           : '"' A_AhkPath '" "' A_ScriptFullPath '"'
+    try Run '*RunAs ' relaunch
+    ExitApp
+}
+
+; ----------------------------------------------------------------
+;  Offsets — live fetch, then offsets.txt, then defaults
+; ----------------------------------------------------------------
+global OFFSET_URL := "https://offsets.imtheo.lol/"
+global OffsetSource := "built-in defaults"
+
+global OFF := LoadOffsets()
+
+LoadOffsets() {
+    global OFFSET_URL, OffsetSource
+    content := ""
+    if (OFFSET_URL != "") {
+        content := HttpGet(OFFSET_URL)
+        if (content != "" && !InStr(content, "namespace Offsets")) {
+            content := ""
+        }
+    }
+    if (content = "" && FileExist(A_ScriptDir "\offsets.txt")) {
+        try content := FileRead(A_ScriptDir "\offsets.txt", "UTF-8")
+        if (content != "" && !InStr(content, "namespace Offsets")) {
+            content := ""
+        } else if (content != "") {
+            OffsetSource := "offsets.txt"
+        }
+    }
+    defaults := DefaultOffsets()
+    if (content = "") {
+        return defaults
+    }
+    parsed := ParseTheoHeader(content)
+    if (parsed.Count = 0) {
+        OffsetSource := "built-in defaults (parse failed)"
+        return defaults
+    }
+    if (RegExMatch(content, 'ClientVersion\s*=\s*"([^"]+)"', &cv)) {
+        OffsetSource := "live — " cv[1]
+    }
+    off := {}
+    missing := []
+    for short, full in AliasMap().OwnProps() {
+        if (parsed.Has(full)) {
+            off.%short% := parsed[full]
+        } else {
+            off.%short% := defaults.%short%
+            missing.Push(full)
+        }
+    }
+    if (missing.Length > 0) {
+        OffsetSource .= " (" missing.Length " fell back)"
+    }
+    return off
+}
+
+HttpGet(url) {
+    try {
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+        http.SetTimeouts(10000, 10000, 10000, 10000)
+        http.Open("GET", url, false)
+        http.Send()
+        if (http.Status = 200) {
+            return http.ResponseText
+        }
+    } catch {
+    }
+    return ""
+}
+
+ParseTheoHeader(content) {
+    out := Map()
+    ns := ""
+    Loop Parse content, "`n", "`r"
+    {
+        line := Trim(A_LoopField)
+        if (RegExMatch(line, "^namespace\s+(\w+)", &m)) {
+            ns := m[1]
+            continue
+        }
+        if (RegExMatch(line, "^inline\s+constexpr\s+uintptr_t\s+(\w+)\s*=\s*(0x[0-9a-fA-F]+)", &e)) {
+            if (ns != "" && ns != "Offsets") {
+                out[ns "." e[1]] := e[2] + 0
+            }
+        }
+    }
+    return out
+}
+
+AliasMap() {
+    return {
+        fdm:      "FakeDataModel.Pointer",
+        rdm:      "FakeDataModel.RealDataModel",
+        ve:       "VisualEngine.Pointer",
+        mat:      "VisualEngine.ViewMatrix",
+        child:    "Instance.ChildrenStart",
+        childEnd: "Instance.ChildrenEnd",
+        nameC:    "Instance.NameContainer",
+        name:     "Instance.Name",
+        lp:       "Player.LocalPlayer",
+        char:     "Player.ModelInstance",
+        disp:     "Player.DisplayName",
+        hp:       "Humanoid.Health",
+        mhp:      "Humanoid.MaxHealth",
+        hrp:      "Humanoid.HumanoidRootPart",
+        prim:     "BasePart.Primitive",
+        ppos:     "Primitive.Position",
+        pvel:     "Primitive.AssemblyLinearVelocity",
+        team:     "Player.TeamColor",
+        cam:      "Workspace.CurrentCamera",
+        camRot:   "Camera.Rotation",
+        camPos:   "Camera.Position",
+        camSubj:  "Camera.CameraSubject",
+        world:    "Workspace.World",
+        wSteps:   "World.worldStepsPerSec",
+        wGrav:    "World.Gravity",
+        roGrav:   "Workspace.ReadOnlyGravity",
+        walkspd:  "Humanoid.Walkspeed",
+        walkchk:  "Humanoid.WalkspeedCheck",
+        jumppwr:  "Humanoid.JumpPower",
+        useJmp:   "Humanoid.UseJumpPower"
+    }
+}
+
+DefaultOffsets() {
+    return {
+        fdm: 0x8E42C98, rdm: 0x1F8, ve: 0x846F768, mat: 0x1B0,
+        child: 0x78, childEnd: 0x8, nameC: 0x70, name: 0x8,
+        lp: 0x130, char: 0x298, disp: 0x138, hp: 0x190, mhp: 0x1A8,
+        hrp: 0x470, prim: 0x188, ppos: 0xD4, pvel: 0xE0, team: 0x3B0,
+        cam: 0x4B8, camRot: 0xD8, camPos: 0xFC, camSubj: 0xC8,
+        world: 0x410, wSteps: 0x728, wGrav: 0x22C, roGrav: 0xA00,
+        walkspd: 0x1D0, walkchk: 0x3B4, jumppwr: 0x1A4, useJmp: 0x1E0
+    }
+}
+
+; ----------------------------------------------------------------
+;  State
+; ----------------------------------------------------------------
+global mem := 0
+global DataModel := 0, PlayersService := 0, WorkspaceAddr := 0, VEAddr := 0
+global Attached := false
+global ViewM := [], MatrixMode := "ROW", MatrixOK := false
+global ScreenW := 0, ScreenH := 0
+global PrevOx := -9999, PrevOy := -9999, PrevCw := -9999, PrevCh := -9999
+global FrameTick := 0
+global HwndOverlay := 0, hBBdc := 0, hBBbm := 0, BBw := 0, BBh := 0
+global EntityCache := []
+global LocalCharPtr := 0, LocalPrimPtr := 0, LocalHumPtr := 0, LocalHeadPrim := 0
+global LocalPlayerPos := ""
+global StatTotal := 0, StatVisible := 0
+global ScanCursor := 0, ScanActive := false
+global ScanResults := [], ScanChildren := []
+global LastScanComplete := 0
+global AimbotTarget := 0, StickyTargetChar := 0
+global LastLMB := false, CurrentCamera := 0
+global LastAimKeyState := false, AimToggleActive := false
+global AimRotBuf := Buffer(36, 0)
+global ReadPosBuf := Buffer(12, 0)
+global VelBuf := Buffer(12, 0)
+global FillRectBuf := Buffer(16, 0)
+global CamX := 0, CamY := 0, CamZ := 0
+global WorldPtr := 0, CamHumanoid := 0
+global GravActive := false, SpeedActive := false
+global JumpActive := false, PhysActive := false, KeepAlive := false
+global GravVal := "196.2", SpeedVal := "50", JumpVal := "100", PhysVal := "60"
+global OverlayEnabled := true
+global ShowBox := true, ShowFill := false, ShowCorner := true
+global ShowHealth := true, ShowName := true, ShowDistance := true
+global ShowSnaplines := true, ShowTracers := false, ShowTeamColor := true
+global RainbowLines := true, ShowTargetInfo := true
+global MaxDrawEntities := 25
+global AimbotOn := true, SilentAimOn := false, ShowFOVCircle := true
+global StickyAimOn := true, AimMode := "Hold"
+global AimbotFOV := 150
+global XSmooth := 0.068, YSmooth := 0.060
+global PredX := 0, PredY := 0
+global EmaDx := 0, EmaDy := 0, LastMoveMag := 0
+global HeadOffset := 0.30
+global TargetPart := "Head", AimKeyMode := "RButton"
+global AimType := "Smooth"
+global AimLastTick := 0
+global BezierT := 0, BezierChar := 0, BezierSide := 1
+global KalTargetChar := 0
+global KalX := 0, KalVx := 0
+global KalY := 0, KalVy := 0
+global KalP00x := 0, KalP01x := 0, KalP11x := 0
+global KalP00y := 0, KalP01y := 0, KalP11y := 0
+global KalLastTick := 0
+global KalQ := 400000, KalR := 40
+
+; ----------------------------------------------------------------
+;  GDI objects
+; ----------------------------------------------------------------
+global TRANSPARENT_KEY := 0xFF00FF
+global hPenBox    := DllCall("gdi32\CreatePen", "Int", 0, "Int", 2, "UInt", 0x00EEFF, "Ptr")
+global hPenTarget := DllCall("gdi32\CreatePen", "Int", 0, "Int", 2, "UInt", 0x00FFFF, "Ptr")
+global hPenFOV    := DllCall("gdi32\CreatePen", "Int", 0, "Int", 1, "UInt", 0x33AA55, "Ptr")
+global RainbowPens := []
+Loop 24 {
+    h := (A_Index - 1) * 15
+    sec := Mod(h, 360) / 60
+    i := Floor(sec), f := sec - i
+    v := 255, p := 0, q := Round(v * (1 - f)), t := Round(v * f)
+    if (i = 0) {
+        r := v, g := t, b := p
+    } else if (i = 1) {
+        r := q, g := v, b := p
+    } else if (i = 2) {
+        r := p, g := v, b := t
+    } else if (i = 3) {
+        r := p, g := q, b := v
+    } else if (i = 4) {
+        r := t, g := p, b := v
+    } else {
+        r := v, g := p, b := q
+    }
+    RainbowPens.Push(DllCall("gdi32\CreatePen", "Int", 0, "Int", 2, "UInt", (b << 16) | (g << 8) | r, "Ptr"))
+}
+global hBrushErase  := DllCall("gdi32\CreateSolidBrush", "UInt", TRANSPARENT_KEY, "Ptr")
+global hBrushBgBar  := DllCall("gdi32\CreateSolidBrush", "UInt", 0x1A1A1A, "Ptr")
+global hBrushFill   := DllCall("gdi32\CreateSolidBrush", "UInt", 0x0A0A28, "Ptr")
+global hBrushHpHigh := DllCall("gdi32\CreateSolidBrush", "UInt", 0x44CC00, "Ptr")
+global hBrushHpMid  := DllCall("gdi32\CreateSolidBrush", "UInt", 0x22CCDD, "Ptr")
+global hBrushHpLow  := DllCall("gdi32\CreateSolidBrush", "UInt", 0x3333CC, "Ptr")
+global hFont := DllCall("gdi32\CreateFontW", "Int", -13, "Int", 0, "Int", 0, "Int", 0, "Int", 700
+    , "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 0
+    , "WStr", "Consolas", "Ptr")
+; VORTEX block art — six lines, each exactly 51 columns wide
+; (lines 3-4 end in a trailing space; keep it or centering drifts)
+global VORTEX_ART := "
+( RTrim0
+██╗   ██╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗
+██║   ██║██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝
+██║   ██║██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝ 
+╚██╗ ██╔╝██║   ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗ 
+ ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗
+  ╚═══╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+)"
+
+; ----------------------------------------------------------------
+;  Control panel — logo header, two clean columns
+; ----------------------------------------------------------------
+global Panel := Gui("+AlwaysOnTop", "VORTEX")
+Panel.BackColor := "0F0F1A"
+Panel.SetFont("s8 cE0E0E0", "Consolas")
+
+; ---- block-letter logo banner — one block ----
+; dark plate the letters sit on
+Panel.Add("Text", "x0 y0 w560 h88 Background2A0A3E", "")
+; the block letters — single control
+Panel.SetFont("s6", "Consolas")
+global LogoText := Panel.Add("Text", "x16 y10 w300 h72 Background2A0A3E c8844FF Center", VORTEX_ART)
+Panel.SetFont("s8 cE0E0E0", "Consolas")
+; gradient accent under the plate
+Panel.Add("Text", "x0 y88 w80 h2 BackgroundFF0066", "")
+Panel.Add("Text", "x80 y88 w80 h2 BackgroundFF6600", "")
+Panel.Add("Text", "x160 y88 w80 h2 Background00FF88", "")
+Panel.Add("Text", "x240 y88 w80 h2 Background00CCFF", "")
+Panel.Add("Text", "x320 y88 w80 h2 Background8844FF", "")
+Panel.Add("Text", "x400 y88 w80 h2 BackgroundFF0066", "")
+Panel.Add("Text", "x480 y88 w80 h2 BackgroundFF6600", "")
+
+global StatusText := Panel.Add("Text", "x324 y24 w230 c00FFCC", OffsetSource)
+Panel.Add("Button", "x324 y46 w110 h20", "Attach").OnEvent("Click", (*) => DoAttach())
+Panel.Add("Button", "x440 y46 w115 h20", "Rescan (F5)").OnEvent("Click", (*) => DoRescan())
+Panel.Add("Text", "x5 y92 w550 c505068", "F4  F5  F6  F7  End")
+
+AddCheck(&state, opts, label, x, y, w := 130) {
+    ctl := Panel.Add("CheckBox", "x" x " y" y " w" w " " opts, label)
+    ctl.OnEvent("Click", (*) => (state := ctl.Value = 1))
+    return ctl
+}
+AddRadio(&state, x, y, w, text, value) {
+    ctl := Panel.Add("Radio", "x" x " y" y " w" w, text)
+    ctl.OnEvent("Click", (*) => (state := value))
+    return ctl
+}
+
+; ===== LEFT COLUMN: VISUALS then MOVEMENT =====
+Panel.Add("Text", "x5 y106 w270 h16 Background001A0E c00FF88 Center", "  VISUALS  ")
+yL := 126
+AddCheck(&ShowBox,       "Checked", "Box",        10, yL), yL += 19
+AddCheck(&ShowCorner,    "Checked", "Corner",     10, yL), yL += 19
+AddCheck(&ShowFill,      "",        "Fill",       10, yL), yL += 19
+AddCheck(&ShowHealth,    "Checked", "Health",     10, yL), yL += 19
+AddCheck(&ShowName,      "Checked", "Name",       10, yL), yL += 19
+AddCheck(&ShowDistance,  "Checked", "Distance",   10, yL), yL += 19
+AddCheck(&ShowSnaplines, "Checked", "Snaplines",  10, yL), yL += 19
+AddCheck(&RainbowLines,  "Checked cFF8800", "Rainbow", 10, yL), yL += 19
+AddCheck(&ShowTeamColor, "Checked", "Team color", 10, yL), yL += 19
+yL += 4
+Panel.Add("Text", "x5 y" yL " w270 h16 Background00101E c4488FF Center", "  MOVEMENT  ")
+yL += 20
+Panel.Add("Text", "x10 y" yL " w35 c505068", "Grav")
+global EdtGrav := Panel.Add("Edit", "x45 y" (yL - 2) " w70 c000000 BackgroundFFFFFF", "196.2")
+Panel.Add("Button", "x120 y" (yL - 2) " w40 h18", "Set").OnEvent("Click", (*) => ApplyGravity())
+yL += 22
+Panel.Add("Text", "x10 y" yL " w35 c505068", "Spd")
+global EdtSpeed := Panel.Add("Edit", "x45 y" (yL - 2) " w70 c000000 BackgroundFFFFFF", "50")
+Panel.Add("Button", "x120 y" (yL - 2) " w40 h18", "Set").OnEvent("Click", (*) => ApplyWalkspeed())
+yL += 22
+Panel.Add("Text", "x10 y" yL " w35 c505068", "Jump")
+global EdtJump := Panel.Add("Edit", "x45 y" (yL - 2) " w70 c000000 BackgroundFFFFFF", "100")
+Panel.Add("Button", "x120 y" (yL - 2) " w40 h18", "Set").OnEvent("Click", (*) => ApplyJumpPower())
+yL += 22
+Panel.Add("Text", "x10 y" yL " w35 c505068", "Phys")
+global EdtPhys := Panel.Add("Edit", "x45 y" (yL - 2) " w70 c000000 BackgroundFFFFFF", "60")
+Panel.Add("Button", "x120 y" (yL - 2) " w40 h18", "Set").OnEvent("Click", (*) => ApplyPhysics())
+Panel.Add("Text", "x165 y" yL " w105 c404058", "Hz — 60 = norm")
+yL += 22
+AddCheck(&KeepAlive, "", "Keep alive", 10, yL, 150)
+Panel.Add("Button", "x170 y" (yL - 2) " w70 h18", "Reset All").OnEvent("Click", (*) => ResetAll())
+yL += 24
+global LblLock := Panel.Add("Text", "x5 y" yL " w270 c00FFCC", "Lock: —")
+
+; ===== RIGHT COLUMN: COMBAT =====
+Panel.Add("Text", "x283 y106 w270 h16 Background1A0010 cFF4488 Center", "  COMBAT  ")
+yR := 126
+AddCheck(&AimbotOn,      "Checked", "Aimbot",            287, yR), yR += 19
+AddCheck(&StickyAimOn,   "Checked", "Sticky aim",        287, yR), yR += 19
+AddCheck(&SilentAimOn,   "",        "Silent aim",        287, yR), yR += 19
+AddCheck(&ShowFOVCircle, "Checked", "FOV circle",        287, yR), yR += 19
+AddCheck(&ShowTargetInfo,"Checked", "Show target +name", 287, yR), yR += 19
+
+Panel.Add("Text", "x287 y" yR " w40 c505068", "FOV")
+global EdtFOV := Panel.Add("Edit", "x322 y" (yR - 2) " w60 c000000 BackgroundFFFFFF", "150")
+EdtFOV.OnEvent("Change", OnFOVChanged)
+Panel.Add("Text", "x390 y" yR " w120 c404058", "px (50-500)")
+yR += 22
+Panel.Add("Text", "x287 y" yR " w40 c505068", "X Spd")
+global EdtXSpd := Panel.Add("Edit", "x322 y" (yR - 2) " w60 c000000 BackgroundFFFFFF", "70")
+EdtXSpd.OnEvent("Change", OnXSpdChanged)
+Panel.Add("Text", "x390 y" yR " w140 c404058", "1=sharp 100=smooth")
+yR += 22
+Panel.Add("Text", "x287 y" yR " w40 c505068", "Y Spd")
+global EdtYSpd := Panel.Add("Edit", "x322 y" (yR - 2) " w60 c000000 BackgroundFFFFFF", "75")
+EdtYSpd.OnEvent("Change", OnYSpdChanged)
+Panel.Add("Text", "x390 y" yR " w140 c404058", "1=sharp 100=smooth")
+yR += 22
+
+; ---- aim type selector — center of the combat column ----
+Panel.Add("Text", "x287 y" yR " w270 c505068", "Aim Type")
+yR += 14
+global RdoNormal := AddRadio(&AimType, 287, yR,  80, "Normal", "Normal")
+global RdoSmooth := AddRadio(&AimType, 369, yR,  90, "Smooth", "Smooth")
+global RdoKalman := AddRadio(&AimType, 459, yR, 100, "Kalman", "Kalman")
+yR += 18
+global RdoExp := AddRadio(&AimType, 287, yR,  90, "Exponential", "Exponential")
+global RdoBezier := AddRadio(&AimType, 379, yR,  80, "Bezier", "Bezier")
+global RdoInstant := AddRadio(&AimType, 459, yR, 100, "Instant", "Instant")
+RdoSmooth.Value := 1
+yR += 18
+
+Panel.Add("Text", "x287 y" yR " w40 c505068", "Pred X")
+global EdtPredX := Panel.Add("Edit", "x322 y" (yR - 2) " w60 c000000 BackgroundFFFFFF", "0")
+EdtPredX.OnEvent("Change", OnPredXChanged)
+Panel.Add("Text", "x390 y" yR " w140 c404058", "ms horiz lead (0=off)")
+yR += 22
+Panel.Add("Text", "x287 y" yR " w40 c505068", "Pred Y")
+global EdtPredY := Panel.Add("Edit", "x322 y" (yR - 2) " w60 c000000 BackgroundFFFFFF", "0")
+EdtPredY.OnEvent("Change", OnPredYChanged)
+Panel.Add("Text", "x390 y" yR " w140 c404058", "ms vert lead (0=off)")
+yR += 22
+Panel.Add("Text", "x287 y" yR " w55 c505068", "Head ±")
+global EdtHeadOff := Panel.Add("Edit", "x345 y" (yR - 2) " w37 c000000 BackgroundFFFFFF", "0.3")
+EdtHeadOff.OnEvent("Change", OnHeadOffChanged)
+Panel.Add("Text", "x390 y" yR " w140 c404058", "stud lift (neg=down)")
+yR += 22
+
+Panel.Add("Text", "x287 y" yR " w270 c505068", "Target"), yR += 14
+global RdoHead := AddRadio(&TargetPart, 287, yR,  90, "Head",    "Head")
+global RdoTorso := AddRadio(&TargetPart, 377, yR,  80, "Torso",   "Torso")
+global RdoNearest := AddRadio(&TargetPart, 457, yR, 100, "Nearest", "Nearest")
+RdoHead.Value := 1
+yR += 18
+Panel.Add("Text", "x287 y" yR " w270 c505068", "Mode"), yR += 14
+global RdoHold := AddRadio(&AimMode, 287, yR, 130, "Hold",   "Hold")
+global RdoToggle := AddRadio(&AimMode, 420, yR, 140, "Toggle", "Toggle")
+RdoHold.Value := 1
+yR += 18
+Panel.Add("Text", "x287 y" yR " w270 c505068", "Key"), yR += 14
+global RdoRMB := AddRadio(&AimKeyMode, 287, yR, 130, "RMB",   "RButton")
+global RdoLMB := AddRadio(&AimKeyMode, 420, yR,  80, "LMB",   "LButton")
+global RdoShift := AddRadio(&AimKeyMode, 505, yR,  55, "Shift", "Shift")
+RdoRMB.Value := 1
+yR += 18
+global RdoAlways := AddRadio(&AimKeyMode, 287, yR, 270, "Always","Always")
+yR += 18
+
+Panel.OnEvent("Close", (*) => ExitApp())
+Panel.Show()
+
+OnFOVChanged(ctrl, *) {
+    global AimbotFOV
+    raw := ctrl.Text
+    if (raw = "" || !RegExMatch(raw, "^\d+$")) {
+        return
+    }
+    AimbotFOV := Max(50, Min(500, raw + 0))
+}
+OnXSpdChanged(ctrl, *) {
+    global XSmooth
+    raw := ctrl.Text
+    if (raw = "" || !RegExMatch(raw, "^\d+$")) {
+        return
+    }
+    v := Max(1, Min(100, raw + 0))
+    XSmooth := 0.30 * (0.03) ** ((v - 1) / 99)
+}
+OnYSpdChanged(ctrl, *) {
+    global YSmooth
+    raw := ctrl.Text
+    if (raw = "" || !RegExMatch(raw, "^\d+$")) {
+        return
+    }
+    v := Max(1, Min(100, raw + 0))
+    YSmooth := 0.30 * (0.03) ** ((v - 1) / 99)
+}
+OnPredXChanged(ctrl, *) {
+    global PredX
+    raw := ctrl.Text
+    if (raw = "" || !RegExMatch(raw, "^\d+$")) {
+        return
+    }
+    PredX := Max(0, Min(500, raw + 0))
+}
+OnPredYChanged(ctrl, *) {
+    global PredY
+    raw := ctrl.Text
+    if (raw = "" || !RegExMatch(raw, "^\d+$")) {
+        return
+    }
+    PredY := Max(0, Min(500, raw + 0))
+}
+OnHeadOffChanged(ctrl, *) {
+    global HeadOffset
+    raw := ctrl.Text
+    if (raw = "" || !RegExMatch(raw, "^-?\d*\.?\d+$")) {
+        return
+    }
+    HeadOffset := Max(-2, Min(2, raw + 0))
+}
+
+; ----------------------------------------------------------------
+;  Movement writes
+; ----------------------------------------------------------------
+RequireAttach() {
+    global Attached, mem
+    return (Attached && IsObject(mem) && mem.hProcess)
+}
+
+ApplyGravity() {
+    global
+    if (!RequireAttach() || !WorldPtr) {
+        StatusText.Text := "⚠ Attach first"
+        return
+    }
+    GravVal := EdtGrav.Text
+    mem.WriteValue(WorldPtr + OFF.wGrav, Float(GravVal), "Float")
+    mem.WriteValue(WorkspaceAddr + OFF.roGrav, Float(GravVal), "Float")
+    GravActive := true
+    StatusText.Text := "Gravity: " GravVal
+}
+
+ApplyWalkspeed() {
+    global
+    if (!RequireAttach()) {
+        StatusText.Text := "⚠ Attach first"
+        return
+    }
+    ResolveCamHumanoid()
+    if (!CamHumanoid) {
+        StatusText.Text := "⚠ No humanoid"
+        return
+    }
+    SpeedVal := EdtSpeed.Text
+    mem.WriteValue(CamHumanoid + OFF.walkspd, Float(SpeedVal), "Float")
+    mem.WriteValue(CamHumanoid + OFF.walkchk, Float(SpeedVal), "Float")
+    SpeedActive := true
+    StatusText.Text := "Speed: " SpeedVal
+}
+
+ApplyJumpPower() {
+    global
+    if (!RequireAttach()) {
+        StatusText.Text := "⚠ Attach first"
+        return
+    }
+    ResolveCamHumanoid()
+    if (!CamHumanoid) {
+        StatusText.Text := "⚠ No humanoid"
+        return
+    }
+    JumpVal := EdtJump.Text
+    mem.WriteValue(CamHumanoid + OFF.jumppwr, Float(JumpVal), "Float")
+    mem.WriteValue(CamHumanoid + OFF.useJmp, 1, "UChar")
+    JumpActive := true
+    StatusText.Text := "Jump: " JumpVal
+}
+
+; physics
+ApplyPhysics() {
+    global
+    if (!RequireAttach() || !WorldPtr) {
+        StatusText.Text := "⚠ Attach first"
+        return
+    }
+    PhysVal := EdtPhys.Text
+    steps := Float(PhysVal) * 4
+    if (steps < 4) {
+        steps := 4
+    }
+    mem.WriteValue(WorldPtr + OFF.wSteps, steps, "Float")
+    PhysActive := true
+    StatusText.Text := "Physics: " PhysVal " Hz"
+}
+
+; full reset ui
+ResetAll() {
+    global
+    GravActive := false, SpeedActive := false, JumpActive := false, PhysActive := false
+    KeepAlive := false
+    GravVal := "196.2", SpeedVal := "50", JumpVal := "100", PhysVal := "60"
+    EdtGrav.Text := "196.2"
+    EdtSpeed.Text := "50"
+    EdtJump.Text := "100"
+    EdtPhys.Text := "60"
+    AimbotFOV := 150
+    EdtFOV.Text := "150"
+    XSmooth := 0.068, YSmooth := 0.060
+    EdtXSpd.Text := "70"
+    EdtYSpd.Text := "75"
+    PredX := 0, PredY := 0
+    EdtPredX.Text := "0"
+    EdtPredY.Text := "0"
+    HeadOffset := 0.30
+    EdtHeadOff.Text := "0.3"
+    AimType := "Smooth"
+    RdoSmooth.Value := 1
+    EmaDx := 0, EmaDy := 0, LastMoveMag := 0
+    AimLastTick := 0
+    BezierT := 0, BezierChar := 0
+    KalmanReset()
+    TargetPart := "Head", AimMode := "Hold", AimKeyMode := "RButton"
+    RdoHead.Value := 1
+    RdoHold.Value := 1
+    RdoRMB.Value := 1
+    StickyTargetChar := 0
+    AimToggleActive := false
+    LastLMB := false
+    LastAimKeyState := false
+    if (RequireAttach() && WorldPtr) {
+        mem.WriteValue(WorldPtr + OFF.wGrav, 196.2, "Float")
+        mem.WriteValue(WorkspaceAddr + OFF.roGrav, 196.2, "Float")
+        mem.WriteValue(WorldPtr + OFF.wSteps, 240, "Float")
+    }
+    if (RequireAttach()) {
+        ResolveCamHumanoid()
+        if (CamHumanoid) {
+            mem.WriteValue(CamHumanoid + OFF.walkspd, 16, "Float")
+            mem.WriteValue(CamHumanoid + OFF.walkchk, 16, "Float")
+            mem.WriteValue(CamHumanoid + OFF.jumppwr, 50, "Float")
+        }
+    }
+    StatusText.Text := "Reset — defaults applied"
+}
+
+ResolveCamHumanoid() {
+    global
+    CamHumanoid := 0
+    if (!WorkspaceAddr) {
+        return
+    }
+    cam := mem.Read(WorkspaceAddr + OFF.cam, "Ptr")
+    if (cam) {
+        CamHumanoid := mem.Read(cam + OFF.camSubj, "Ptr")
+    }
+}
+
+; ----------------------------------------------------------------
+;  Overlay window
+; ----------------------------------------------------------------
+Overlay := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20 +E0x80000 +LastFound")
+Overlay.BackColor := "FF00FF"
+Overlay.Show("x0 y0 w200 h100 NoActivate Hide")
+HwndOverlay := WinExist()
+SetTransKey(HwndOverlay)
+OnMessage(0x14, OnNoErase)
+OnMessage(0x0F, OnOverlayPaint)
+
+F4:: {
+    global OverlayEnabled
+    OverlayEnabled := !OverlayEnabled
+    if (!OverlayEnabled && hBBdc && BBw > 0) {
+        ClearOverlay()
+    }
+}
+F5:: DoRescan()
+F6:: DebugDump()
+F7:: EntityReport()
+F8:: {
+    global MatrixMode
+    MatrixMode := (MatrixMode = "ROW") ? "COL" : "ROW"
+}
+End::ExitApp()
+
+ClearOverlay() {
+    global hBBdc, BBw, BBh, hBrushErase, HwndOverlay
+    FillRect(hBBdc, 0, 0, BBw, BBh, hBrushErase)
+    hdc := DllCall("user32\GetDC", "Ptr", HwndOverlay, "Ptr")
+    DllCall("gdi32\BitBlt", "Ptr", hdc, "Int", 0, "Int", 0, "Int", BBw, "Int", BBh
+        , "Ptr", hBBdc, "Int", 0, "Int", 0, "UInt", 0x00CC0020)
+    DllCall("user32\ReleaseDC", "Ptr", HwndOverlay, "Ptr", hdc)
+}
+
+; ----------------------------------------------------------------
+;  Attach
+; ----------------------------------------------------------------
+DoAttach() {
+    global
+    SetTimer RenderFrame, 0
+    Attached := false
+    FrameTick := 0
+    EntityCache := []
+    LocalCharPtr := 0, LocalPrimPtr := 0, LocalHumPtr := 0, LocalHeadPrim := 0
+    CurrentCamera := 0, WorldPtr := 0, CamHumanoid := 0
+    AimbotTarget := 0, StickyTargetChar := 0, AimToggleActive := false
+    EmaDx := 0, EmaDy := 0, LastMoveMag := 0
+    AimLastTick := 0
+    BezierT := 0, BezierChar := 0
+    KalmanReset()
+    ScanCursor := 0, ScanActive := false, ScanResults := [], ScanChildren := []
+    StatusText.Text := "Attaching..."
+    mem := RobloxMemory("RobloxPlayerBeta.exe")
+    if (!mem.hProcess) {
+        StatusText.Text := "✖ Attach failed"
+        return
+    }
+    fdm := mem.Read(mem.BaseAddress + OFF.fdm, "Ptr")
+    DataModel := fdm ? mem.Read(fdm + OFF.rdm, "Ptr") : 0
+    if (!DataModel) {
+        StatusText.Text := "✖ DataModel not found"
+        return
+    }
+    PlayersService := FindService("Players")
+    WorkspaceAddr := FindService("Workspace")
+    if (!WorkspaceAddr) {
+        StatusText.Text := "✖ Workspace not found"
+        return
+    }
+    ve := mem.Read(mem.BaseAddress + OFF.ve, "Ptr")
+    VEAddr := ve ? ve : 0
+    RefreshWorldPointers()
+    rbxHwnd := WinExist("ahk_exe RobloxPlayerBeta.exe")
+    rc := GetClientRect(rbxHwnd)
+    InitBackbuffer(rc.w, rc.h)
+    PositionOverlay(HwndOverlay, rc.x, rc.y, rc.w, rc.h)
+    DllCall("user32\ShowWindow", "Ptr", HwndOverlay, "Int", 4)
+    SetTransKey(HwndOverlay)
+    DllCall("user32\ValidateRect", "Ptr", HwndOverlay, "Ptr", 0)
+    Attached := true
+    SetTimer RenderFrame, 33
+    StartScan()
+    StatusText.Text := "VORTEX Active"
+}
+
+RefreshWorldPointers() {
+    global
+    WorldPtr := mem.Read(WorkspaceAddr + OFF.world, "Ptr")
+    CurrentCamera := mem.Read(WorkspaceAddr + OFF.cam, "Ptr")
+    if (CurrentCamera) {
+        CamHumanoid := mem.Read(CurrentCamera + OFF.camSubj, "Ptr")
+        CamX := mem.Read(CurrentCamera + OFF.camPos, "Float")
+        CamY := mem.Read(CurrentCamera + OFF.camPos + 4, "Float")
+        CamZ := mem.Read(CurrentCamera + OFF.camPos + 8, "Float")
+    }
+}
+
+DoRescan() {
+    global
+    if (!Attached) {
+        return
+    }
+    EntityCache := []
+    LocalCharPtr := 0, LocalPrimPtr := 0, LocalHumPtr := 0, LocalHeadPrim := 0
+    CurrentCamera := 0, WorldPtr := 0, CamHumanoid := 0
+    StickyTargetChar := 0
+    WorkspaceAddr := FindService("Workspace")
+    PlayersService := FindService("Players")
+    if (WorkspaceAddr) {
+        RefreshWorldPointers()
+    }
+    StartScan()
+    StatusText.Text := "Rescanning..."
+}
+
+; ----------------------------------------------------------------
+;  Entity scan rahhhh
+; ----------------------------------------------------------------
+StartScan() {
+    global
+    if (!WorkspaceAddr) {
+        return
+    }
+    ScanActive := true
+    ScanCursor := 0
+    ScanResults := []
+    ScanChildren := GetChildren(WorkspaceAddr)
+}
+
+ProcessScanChunk() {
+    global
+    if (!ScanActive) {
+        return
+    }
+    remaining := 5
+    while (remaining > 0 && ScanCursor < ScanChildren.Length) {
+        ws := ScanChildren[ScanCursor + 1]
+        ScanCursor++
+        remaining--
+        if (!ws) {
+            continue
+        }
+        hum := LocateHumanoid(ws)
+        if (hum) {
+            ScanResults.Push({char: ws, hum: hum, prim: 0, headPrim: 0, name: "", team: 0})
+            continue
+        }
+        for sub in GetChildren(ws) {
+            if (!sub) {
+                continue
+            }
+            hum2 := LocateHumanoid(sub)
+            if (hum2) {
+                ScanResults.Push({char: sub, hum: hum2, prim: 0, headPrim: 0, name: "", team: 0})
+            }
+        }
+    }
+    if (ScanCursor >= ScanChildren.Length) {
+        FinishScan()
+    }
+}
+
+FinishScan() {
+    global
+    ScanActive := false
+    LastScanComplete := A_TickCount
+    teamLookup := Map(), charLookup := Map()
+    if (PlayersService) {
+        for pl in GetChildren(PlayersService) {
+            nm := ReadDisplayName(pl)
+            if (nm != "?") {
+                teamLookup[nm] := mem.Read(pl + OFF.team, "UInt")
+                ch := mem.Read(pl + OFF.char, "Ptr")
+                if (ch) {
+                    charLookup[nm] := ch
+                }
+            }
+        }
+    }
+    final := [], seen := Map()
+    for nm, ch in charLookup {
+        if (ch && !seen.Has(ch)) {
+            hum := LocateHumanoid(ch)
+            if (hum) {
+                prim := ResolvePrim(hum, ch)
+                headPrim := ResolveHeadPrim(ch)
+                seen[ch] := true
+                final.Push({char: ch, hum: hum, prim: prim, headPrim: headPrim, name: nm
+                    , team: teamLookup[nm]
+                    , hp: SafeHp(hum), maxhp: SafeMaxHp(hum)})
+            }
+        }
+    }
+    for ent in ScanResults {
+        if (seen.Has(ent.char)) {
+            continue
+        }
+        nm := ReadInstanceName(ent.char)
+        team := teamLookup.Has(nm) ? teamLookup[nm] : 0
+        prim := ResolvePrim(ent.hum, ent.char)
+        headPrim := ResolveHeadPrim(ent.char)
+        seen[ent.char] := true
+        final.Push({char: ent.char, hum: ent.hum, prim: prim, headPrim: headPrim, name: nm
+            , team: team
+            , hp: SafeHp(ent.hum), maxhp: SafeMaxHp(ent.hum)})
+    }
+    EntityCache := final
+    ScanResults := []
+}
+
+SafeHp(hum) {
+    global mem, OFF
+    return (hum > 0x10000) ? mem.Read(hum + OFF.hp, "Float") : 0
+}
+SafeMaxHp(hum) {
+    global mem, OFF
+    return (hum > 0x10000) ? mem.Read(hum + OFF.mhp, "Float") : 0
+}
+
+ResolvePrim(hum, charModel) {
+    global mem, OFF
+    rootPart := mem.Read(hum + OFF.hrp, "Ptr")
+    if (rootPart) {
+        prim := mem.Read(rootPart + OFF.prim, "Ptr")
+        if (prim) {
+            testX := mem.Read(prim + OFF.ppos, "Float")
+            if (testX != 0 && Abs(testX) < 1000000) {
+                return prim
+            }
+        }
+    }
+    for child in GetChildren(charModel) {
+        if (!child || child = hum) {
+            continue
+        }
+        nm := ReadInstanceName(child)
+        if (nm = "Handle" || InStr(nm, "Handle") || InStr(nm, "Tool")) {
+            continue
+        }
+        childPrim := mem.Read(child + OFF.prim, "Ptr")
+        if (childPrim) {
+            testX := mem.Read(childPrim + OFF.ppos, "Float")
+            if (testX != 0 && Abs(testX) < 1000000) {
+                return childPrim
+            }
+        }
+    }
+    return 0
+}
+
+; the literal "Head" part — both R6 and R15 name it that
+ResolveHeadPrim(charModel) {
+    global mem, OFF
+    for child in GetChildren(charModel) {
+        if (!child) {
+            continue
+        }
+        if (ReadInstanceName(child) = "Head") {
+            prim := mem.Read(child + OFF.prim, "Ptr")
+            if (prim) {
+                testX := mem.Read(prim + OFF.ppos, "Float")
+                if (testX != 0 && Abs(testX) < 1000000) {
+                    return prim
+                }
+            }
+        }
+    }
+    return 0
+}
+
+; ----------------------------------------------------------------
+;  Frame loop
+; ----------------------------------------------------------------
+RenderFrame() {
+    global
+    if (!RequireAttach()) {
+        SetTimer RenderFrame, 0
+        Attached := false
+        return
+    }
+    rbxHwnd := WinExist("ahk_exe RobloxPlayerBeta.exe")
+    if (!rbxHwnd) {
+        return
+    }
+    FrameTick++
+    rc := GetClientRect(rbxHwnd)
+    ScreenW := rc.w, ScreenH := rc.h
+    if (rc.x != PrevOx || rc.y != PrevOy || rc.w != PrevCw || rc.h != PrevCh) {
+        PositionOverlay(HwndOverlay, rc.x, rc.y, rc.w, rc.h)
+        PrevOx := rc.x, PrevOy := rc.y, PrevCw := rc.w, PrevCh := rc.h
+    }
+    InitBackbuffer(rc.w, rc.h)
+    ve := mem.Read(mem.BaseAddress + OFF.ve, "Ptr")
+    if (ve) {
+        VEAddr := ve
+    }
+    MatrixOK := false
+    if (VEAddr) {
+        MatrixOK := LoadViewMatrix(VEAddr)
+    }
+    if (!MatrixOK || ViewM.Length < 16 || Abs(ViewM[16]) < 0.0001) {
+        return
+    }
+    if (Mod(FrameTick, 30) = 0) {
+        RefreshWorldPointers()
+    }
+    if (ScanActive) {
+        ProcessScanChunk()
+    } else if ((A_TickCount - LastScanComplete) > 5000) {
+        StartScan()
+    }
+    if (Mod(FrameTick, 15) = 0 || !LocalCharPtr) {
+        ResolveLocalPlayer()
+    } else if (LocalPrimPtr) {
+        p := ReadPositionFast(LocalPrimPtr)
+        if (IsObject(p)) {
+            LocalPlayerPos := p
+        } else {
+            LocalPrimPtr := 0
+        }
+    }
+    if (KeepAlive && Mod(FrameTick, 60) = 0) {
+        MovementKeepAlive()
+    }
+    UpdateCombat()
+    FillRect(hBBdc, 0, 0, rc.w, rc.h, hBrushErase)
+    StatTotal := EntityCache.Length
+    StatVisible := 0
+    rbIdx := Mod(FrameTick // 3, 24) + 1
+    rainbowPen := RainbowPens[rbIdx]
+    if (OverlayEnabled) {
+        DrawEntities(rainbowPen)
+        DrawCombatHud(rainbowPen)
+    }
+    PresentOverlay(rc.w, rc.h)
+    UpdatePanelLabels()
+}
+
+DrawEntities(rainbowPen) {
+    global
+    refreshHp := (Mod(FrameTick, 30) = 0)
+    drawnCount := 0
+    for ent in EntityCache {
+        if (ent.char = LocalCharPtr) {
+            continue
+        }
+        if (!ent.prim || !ent.hum || ent.hum < 0x10000) {
+            continue
+        }
+        if (drawnCount >= MaxDrawEntities) {
+            break
+        }
+        if (refreshHp) {
+            ent.hp := mem.Read(ent.hum + OFF.hp, "Float")
+            ent.maxhp := mem.Read(ent.hum + OFF.mhp, "Float")
+        }
+        if (ent.hp <= 0.01) {
+            continue
+        }
+        pos := ReadPositionFast(ent.prim)
+        if (!IsObject(pos)) {
+            ent.prim := 0
+            continue
+        }
+        if (!ProjectToScreen(pos[1], pos[2] - 3.0, pos[3], &sx1, &sy1)) {
+            continue
+        }
+        if (!ProjectToScreen(pos[1], pos[2] + 3.0, pos[3], &sx2, &sy2)) {
+            continue
+        }
+        bh := sy1 - sy2
+        if (bh < 0.5 || bh > ScreenH * 2) {
+            continue
+        }
+        bhDraw := Max(bh, 6)
+        cxc := (sx1 + sx2) * 0.5
+        cyc := (sy1 + sy2) * 0.5
+        bw := bhDraw * 0.5
+        x1 := cxc - bw / 2, x2 := cxc + bw / 2
+        y1 := cyc - bhDraw / 2, y2 := cyc + bhDraw / 2
+        dist := 0
+        if (IsObject(LocalPlayerPos)) {
+            dx := pos[1] - LocalPlayerPos[1]
+            dy := pos[2] - LocalPlayerPos[2]
+            dz := pos[3] - LocalPlayerPos[3]
+            dist := Sqrt(dx * dx + dy * dy + dz * dz)
+        }
+        distLabel := (dist > 0) ? "  " Round(dist) "m" : ""
+        boxPen := hPenBox
+        hasCustomPen := false
+        isTarget := (AimbotTarget && AimbotTarget.ent = ent)
+        if (isTarget) {
+            boxPen := RainbowLines ? rainbowPen : hPenTarget
+        } else if (ShowTeamColor && ent.team) {
+            boxPen := DllCall("gdi32\CreatePen", "Int", 0, "Int", 2, "UInt", ent.team, "Ptr")
+            hasCustomPen := true
+        }
+        if (ShowFill) {
+            oldB := DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", hBrushFill, "Ptr")
+            DllCall("gdi32\Rectangle", "Ptr", hBBdc, "Int", Round(x1), "Int", Round(y1)
+                , "Int", Round(x2), "Int", Round(y2))
+            DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", oldB, "Ptr")
+        }
+        if (ShowBox) {
+            if (ShowCorner) {
+                DrawCornerBox(hBBdc, x1, y1, x2, y2, boxPen)
+            } else {
+                DrawBox(hBBdc, x1, y1, x2, y2, boxPen)
+            }
+        }
+        if (ShowHealth) {
+            barX := x1 - 6, barW := 3
+            FillRect(hBBdc, barX, y1, barX + barW, y2, hBrushBgBar)
+            pct := (ent.maxhp > 0) ? ent.hp / ent.maxhp : 0
+            if (pct > 1) {
+                pct := 1
+            }
+            if (pct < 0) {
+                pct := 0
+            }
+            hpB := (pct > 0.5) ? hBrushHpHigh : (pct > 0.25) ? hBrushHpMid : hBrushHpLow
+            barH := (y2 - y1) * pct
+            if (barH >= 1) {
+                FillRect(hBBdc, barX + 1, y2 - barH, barX + barW - 1, y2, hpB)
+            }
+        }
+        labelText := ""
+        if (ShowName) {
+            labelText .= ent.name
+        }
+        if (isTarget) {
+            labelText .= " ⌖"
+        }
+        if (ShowDistance) {
+            labelText .= distLabel
+        }
+        if (labelText != "") {
+            DrawText(hBBdc, labelText, Round(cxc - 80), Round(y1 - 18)
+                , isTarget ? 0x00FFFF : 0xEEEEEE)
+        }
+        snapPen := RainbowLines ? rainbowPen : hPenBox
+        if (ShowSnaplines && dist > 0) {
+            DrawLine(hBBdc, ScreenW / 2, ScreenH, cxc, y2, snapPen)
+        }
+        if (ShowTracers && dist > 0) {
+            DrawLine(hBBdc, ScreenW / 2, 0, cxc, y1, snapPen)
+        }
+        if (hasCustomPen) {
+            DllCall("gdi32\DeleteObject", "Ptr", boxPen, "Ptr")
+        }
+        drawnCount++
+        StatVisible++
+    }
+}
+
+; unemployed work-
+
+
+DrawCombatHud(rainbowPen) {
+    global
+    if (ShowFOVCircle && AimbotOn) {
+        fovPen := RainbowLines ? rainbowPen : hPenFOV
+        oldP := DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", fovPen, "Ptr")
+        oldB := DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr"
+            , DllCall("gdi32\GetStockObject", "Int", 5, "Ptr"), "Ptr")
+        DllCall("gdi32\Ellipse", "Ptr", hBBdc
+            , "Int", Round(ScreenW / 2 - AimbotFOV), "Int", Round(ScreenH / 2 - AimbotFOV)
+            , "Int", Round(ScreenW / 2 + AimbotFOV), "Int", Round(ScreenH / 2 + AimbotFOV))
+        DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", oldB, "Ptr")
+        DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", oldP, "Ptr")
+    }
+    if (AimbotTarget) {
+        tx := Round(AimbotTarget.sx)
+        ty := Round(AimbotTarget.sy)
+        tgtPen := RainbowLines ? rainbowPen : hPenTarget
+        oldP := DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", tgtPen, "Ptr")
+        DllCall("gdi32\MoveToEx", "Ptr", hBBdc, "Int", tx - 10, "Int", ty, "Ptr", 0)
+        DllCall("gdi32\LineTo", "Ptr", hBBdc, "Int", tx + 10, "Int", ty)
+        DllCall("gdi32\MoveToEx", "Ptr", hBBdc, "Int", tx, "Int", ty - 10, "Ptr", 0)
+        DllCall("gdi32\LineTo", "Ptr", hBBdc, "Int", tx, "Int", ty + 10)
+        DllCall("gdi32\Ellipse", "Ptr", hBBdc, "Int", tx - 3, "Int", ty - 3, "Int", tx + 3, "Int", ty + 3)
+        DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", oldP, "Ptr")
+        if (ShowTargetInfo) {
+            DrawText(hBBdc, "+ " AimbotTarget.ent.name, tx + 12, ty - 8, 0x00FFFF)
+        }
+    }
+}
+
+PresentOverlay(w, h) {
+    global
+    hdc := DllCall("user32\GetDC", "Ptr", HwndOverlay, "Ptr")
+    DllCall("gdi32\BitBlt", "Ptr", hdc, "Int", 0, "Int", 0, "Int", w, "Int", h
+        , "Ptr", hBBdc, "Int", 0, "Int", 0, "UInt", 0x00CC0020)
+    DllCall("user32\ReleaseDC", "Ptr", HwndOverlay, "Ptr", hdc)
+    DllCall("user32\ValidateRect", "Ptr", HwndOverlay, "Ptr", 0)
+}
+
+UpdatePanelLabels() {
+    global
+    if (ShowTargetInfo) {
+        if (AimbotTarget) {
+            LblLock.Text := "⌖ " AimbotTarget.ent.name
+        } else {
+            LblLock.Text := "Lock: —"
+        }
+    }
+}
+
+; ----------------------------------------------------------------
+;  Movement keep-alive — writes only when the value actually drifted
+; ----------------------------------------------------------------
+MovementKeepAlive() {
+    global
+    if (!WorldPtr) {
+        WorldPtr := mem.Read(WorkspaceAddr + OFF.world, "Ptr")
+    }
+    if (GravActive && WorldPtr) {
+        cur := mem.Read(WorldPtr + OFF.wGrav, "Float")
+        if (cur != Float(GravVal)) {
+            mem.WriteValue(WorldPtr + OFF.wGrav, Float(GravVal), "Float")
+        }
+    }
+    if (PhysActive && WorldPtr) {
+        want := Float(PhysVal) * 4
+        if (want < 4) {
+            want := 4
+        }
+        cur := mem.Read(WorldPtr + OFF.wSteps, "Float")
+        if (cur != want) {
+            mem.WriteValue(WorldPtr + OFF.wSteps, want, "Float")
+        }
+    }
+    if (SpeedActive || JumpActive) {
+        ResolveCamHumanoid()
+        if (CamHumanoid) {
+            if (SpeedActive) {
+                cur := mem.Read(CamHumanoid + OFF.walkspd, "Float")
+                if (cur != Float(SpeedVal)) {
+                    mem.WriteValue(CamHumanoid + OFF.walkspd, Float(SpeedVal), "Float")
+                    mem.WriteValue(CamHumanoid + OFF.walkchk, Float(SpeedVal), "Float")
+                }
+            }
+            if (JumpActive) {
+                cur := mem.Read(CamHumanoid + OFF.jumppwr, "Float")
+                if (cur != Float(JumpVal)) {
+                    mem.WriteValue(CamHumanoid + OFF.jumppwr, Float(JumpVal), "Float")
+                }
+            }
+        }
+    }
+}
+
+; ----------------------------------------------------------------
+;  Combat — target selection and aim
+; ----------------------------------------------------------------
+UpdateCombat() {
+    global
+    AimbotTarget := 0
+    if ((AimbotOn || SilentAimOn) && Attached) {
+        AimbotTarget := FindAimbotTarget()
+    }
+    if (SilentAimOn && Attached) {
+        currentLMB := GetKeyState("LButton", "P")
+        if (currentLMB && !LastLMB && AimbotTarget) {
+            ExecuteCameraAim(AimbotTarget)
+        }
+        LastLMB := currentLMB
+    }
+    keyActive := false
+    if (AimbotOn && AimbotTarget) {
+        keyActive := IsAimKeyActive()
+        if (keyActive) {
+            StickyTargetChar := AimbotTarget.ent.char
+            if (AimType = "Kalman") {
+                KalmanStep(AimbotTarget.ent.char, AimbotTarget.sx, AimbotTarget.sy)
+                AimbotTarget.sx := KalX
+                AimbotTarget.sy := KalY
+            }
+            if (AimType = "Instant") {
+                ; rotation write every frame — no mouse, no sensitivity
+                ; gain, no overshoot. crosshair is welded to the head.
+                ExecuteCameraAim(AimbotTarget)
+            } else {
+                ApplyAimbotMovement(AimbotTarget)
+            }
+        }
+    }
+    if (!keyActive) {
+        EmaDx := 0
+        EmaDy := 0
+        LastMoveMag := 0
+        AimLastTick := 0
+        BezierT := 0
+        BezierChar := 0
+        KalmanReset()
+    }
+}
+
+IsAimKeyActive() {
+    global AimKeyMode, AimMode, AimToggleActive, LastAimKeyState
+    if (AimKeyMode = "Always") {
+        return true
+    }
+    keyDown := GetKeyState(AimKeyMode, "P")
+    if (AimMode = "Toggle") {
+        if (keyDown && !LastAimKeyState) {
+            AimToggleActive := !AimToggleActive
+        }
+        LastAimKeyState := keyDown
+        return AimToggleActive
+    }
+    return keyDown
+}
+
+; ---- Kalman filter ----
+KalmanReset() {
+    global
+    KalTargetChar := 0
+    KalX := 0, KalVx := 0
+    KalY := 0, KalVy := 0
+    KalP00x := 0, KalP01x := 0, KalP11x := 0
+    KalP00y := 0, KalP01y := 0, KalP11y := 0
+    KalLastTick := 0
+}
+
+KalmanStep(charPtr, zx, zy) {
+    global
+    if (KalTargetChar != charPtr) {
+        KalTargetChar := charPtr
+        KalX := zx, KalVx := 0
+        KalY := zy, KalVy := 0
+        KalP00x := 400, KalP01x := 0, KalP11x := 500
+        KalP00y := 400, KalP01y := 0, KalP11y := 500
+        KalLastTick := A_TickCount
+        return
+    }
+    dt := (A_TickCount - KalLastTick) / 1000.0
+    KalLastTick := A_TickCount
+    if (dt < 0.010) {
+        dt := 0.010
+    }
+    if (dt > 0.100) {
+        dt := 0.100
+    }
+    KalmanAxis(&KalX, &KalVx, &KalP00x, &KalP01x, &KalP11x, zx, dt)
+    KalmanAxis(&KalY, &KalVy, &KalP00y, &KalP01y, &KalP11y, zy, dt)
+}
+
+KalmanAxis(&x, &v, &p00, &p01, &p11, z, dt) {
+    x := x + v * dt
+    q00 := KalQ * dt * dt * dt * dt / 4
+    q01 := KalQ * dt * dt * dt / 2
+    q11 := KalQ * dt * dt
+    t00 := p00 + dt * 2 * p01 + dt * dt * p11 + q00
+    t01 := p01 + dt * p11 + q01
+    t11 := p11 + q11
+    p00 := t00, p01 := t01, p11 := t11
+    s := p00 + KalR
+    k0 := p00 / s
+    k1 := p01 / s
+    y := z - x
+    x := x + k0 * y
+    v := v + k1 * y
+    p00 := (1 - k0) * p00
+    p11 := p11 - k1 * p01
+    p01 := (1 - k0) * p01
+}
+
+; the point the aimbot chases — real Head part when cached
+GetAimPoint(ent) {
+    global TargetPart, HeadOffset
+    if (TargetPart = "Head" && ent.headPrim) {
+        hp := ReadPositionFast(ent.headPrim)
+        if (IsObject(hp)) {
+            hp[2] += HeadOffset
+            return hp
+        }
+        ent.headPrim := 0
+    }
+    pos := ReadPositionFast(ent.prim)
+    if (!IsObject(pos)) {
+        return ""
+    }
+    switch TargetPart {
+        case "Head":
+            pos[2] += 2.5 + HeadOffset
+        case "Torso":
+            pos[2] += 1.0
+        case "Nearest":
+            pos[2] += 1.5
+        default:
+            pos[2] += 2.5 + HeadOffset
+    }
+    return pos
+}
+
+FindAimbotTarget() {
+    global
+    if (!Attached || EntityCache.Length = 0) {
+        return 0
+    }
+    centerX := ScreenW / 2
+    centerY := ScreenH / 2
+    bestDist := AimbotFOV
+    bestTarget := 0
+    for ent in EntityCache {
+        if (ent.char = LocalCharPtr || !ent.prim || !ent.hum || ent.hum < 0x10000) {
+            continue
+        }
+        if (ent.hp <= 0.01) {
+            continue
+        }
+        aim := GetAimPoint(ent)
+        if (!IsObject(aim)) {
+            continue
+        }
+        if (!ProjectToScreen(aim[1], aim[2], aim[3], &sx, &sy)) {
+            continue
+        }
+        dx := sx - centerX
+        dy := sy - centerY
+        screenDist := Sqrt(dx * dx + dy * dy)
+        isSticky := (StickyAimOn && ent.char = StickyTargetChar)
+        fovLimit := isSticky ? AimbotFOV * 1.5 : AimbotFOV
+        if (screenDist > fovLimit) {
+            continue
+        }
+        if (PredX > 0 || PredY > 0) {
+            vel := ReadVelocityFast(ent.prim)
+            if (IsObject(vel)) {
+                tX := PredX / 1000.0
+                tY := PredY / 1000.0
+                px := aim[1] + vel[1] * tX
+                py := aim[2] + vel[2] * tY
+                pz := aim[3] + vel[3] * tX
+                if (ProjectToScreen(px, py, pz, &sx, &sy)) {
+                    dx := sx - centerX
+                    dy := sy - centerY
+                    screenDist := Sqrt(dx * dx + dy * dy)
+                }
+            }
+        }
+        effectiveDist := isSticky ? screenDist * 0.2 : screenDist
+        if (effectiveDist < bestDist) {
+            bestDist := effectiveDist
+            bestTarget := {ent: ent, sx: sx, sy: sy, dist: screenDist}
+        }
+    }
+    return bestTarget
+}
+
+ReadVelocityFast(primPtr) {
+    global mem, OFF, VelBuf
+    if (!primPtr || primPtr < 0x10000) {
+        return ""
+    }
+    if (!DllCall("ReadProcessMemory", "Ptr", mem.hProcess, "Ptr", primPtr + OFF.pvel
+        , "Ptr", VelBuf, "UPtr", 12, "Ptr", 0)) {
+        return ""
+    }
+    x := NumGet(VelBuf, 0, "Float")
+    y := NumGet(VelBuf, 4, "Float")
+    z := NumGet(VelBuf, 8, "Float")
+    if (Abs(x) > 10000 || Abs(y) > 10000 || Abs(z) > 10000) {
+        return ""
+    }
+    return [x, y, z]
+}
+
+; ---- mouse-based aim types ----
+ApplyAimbotMovement(target) {
+    global
+    dx := target.sx - ScreenW / 2
+    dy := target.sy - ScreenH / 2
+    err := Sqrt(dx * dx + dy * dy)
+    dt := 1 / 30
+    if (AimLastTick) {
+        dt := (A_TickCount - AimLastTick) / 1000.0
+        if (dt < 0.010) {
+            dt := 0.010
+        }
+        if (dt > 0.100) {
+            dt := 0.100
+        }
+    }
+    AimLastTick := A_TickCount
+    switch AimType {
+        case "Exponential":
+            if (err < 2) {
+                return
+            }
+            pow := dt * 30
+            ax := 1 - (1 - XSmooth) ** pow
+            ay := 1 - (1 - YSmooth) ** pow
+            moveX := dx * ax
+            moveY := dy * ay
+            moveX := Max(-30, Min(30, moveX))
+            moveY := Max(-30, Min(30, moveY))
+        case "Bezier":
+            if (BezierChar != target.ent.char) {
+                BezierChar := target.ent.char
+                BezierT := 0
+            }
+            if (BezierT < 1 && err > 4) {
+                BezierT := BezierT + XSmooth * (dt * 30)
+                if (BezierT > 1) {
+                    BezierT := 1
+                }
+                cx0 := ScreenW / 2, cy0 := ScreenH / 2
+                tx := target.sx, ty := target.sy
+                dirx := tx - cx0, diry := ty - cy0
+                dLen := Sqrt(dirx * dirx + diry * diry)
+                if (dLen > 1) {
+                    px := -diry / dLen, py := dirx / dLen
+                    bow := dLen * 0.35 * BezierSide * (1 - BezierT)
+                    mx := (cx0 + tx) / 2 + px * bow
+                    my := (cy0 + ty) / 2 + py * bow
+                    u := 1 - BezierT
+                    bx := u * u * cx0 + 2 * u * BezierT * mx + BezierT * BezierT * tx
+                    by := u * u * cy0 + 2 * u * BezierT * my + BezierT * BezierT * ty
+                    moveX := bx - cx0
+                    moveY := by - cy0
+                } else {
+                    moveX := dx * XSmooth
+                    moveY := dy * YSmooth
+                }
+            } else {
+                moveX := dx * XSmooth
+                moveY := dy * YSmooth
+            }
+            moveX := Max(-30, Min(30, moveX))
+            moveY := Max(-30, Min(30, moveY))
+        case "Kalman":
+            if (err < 2) {
+                return
+            }
+            moveX := dx * XSmooth
+            moveY := dy * YSmooth
+            moveX := Max(-25, Min(25, moveX))
+            moveY := Max(-25, Min(25, moveY))
+        case "Smooth":
+            if (err < 2) {
+                return
+            }
+            if (err > 25) {
+                moveX := dx * XSmooth
+                moveY := dy * YSmooth
+                moveX := Max(-30, Min(30, moveX))
+                moveY := Max(-30, Min(30, moveY))
+            } else {
+                EmaDx := EmaDx * 0.5 + dx * 0.5
+                EmaDy := EmaDy * 0.5 + dy * 0.5
+                factor := (LastMoveMag > 8) ? 0.5 : 1.0
+                moveX := EmaDx * XSmooth * factor
+                moveY := EmaDy * YSmooth * factor
+                moveX := Max(-15, Min(15, moveX))
+                moveY := Max(-15, Min(15, moveY))
+            }
+        default: ; Normal
+            if (err < 2) {
+                return
+            }
+            moveX := dx * XSmooth
+            moveY := dy * YSmooth
+            moveX := Max(-30, Min(30, moveX))
+            moveY := Max(-30, Min(30, moveY))
+    }
+    LastMoveMag := Sqrt(moveX * moveX + moveY * moveY)
+    DllCall("mouse_event", "UInt", 0x0001, "Int", Round(moveX), "Int", Round(moveY)
+        , "UInt", 0, "UInt", 0)
+}
+
+ExecuteCameraAim(target) {
+    global
+    if (!CurrentCamera || !target) {
+        return
+    }
+    aim := GetAimPoint(target.ent)
+    if (!IsObject(aim)) {
+        return
+    }
+    tdx := aim[1] - CamX
+    tdy := aim[2] - CamY
+    tdz := aim[3] - CamZ
+    len := Sqrt(tdx * tdx + tdy * tdy + tdz * tdz)
+    if (len < 0.001) {
+        return
+    }
+    tdx /= len, tdy /= len, tdz /= len
+    zx := -tdx, zy := -tdy, zz := -tdz
+    xx := zz, xy := 0.0, xz := -zx
+    xLen := Sqrt(xx * xx + xy * xy + xz * xz)
+    if (xLen < 0.001) {
+        return
+    }
+    xx /= xLen, xy /= xLen, xz /= xLen
+    yx := zy * xz - zz * xy
+    yy := zz * xx - zx * xz
+    yz := zx * xy - zy * xx
+    NumPut("Float", xx, AimRotBuf, 0)
+    NumPut("Float", xy, AimRotBuf, 4)
+    NumPut("Float", xz, AimRotBuf, 8)
+    NumPut("Float", yx, AimRotBuf, 12)
+    NumPut("Float", yy, AimRotBuf, 16)
+    NumPut("Float", yz, AimRotBuf, 20)
+    NumPut("Float", zx, AimRotBuf, 24)
+    NumPut("Float", zy, AimRotBuf, 28)
+    NumPut("Float", zz, AimRotBuf, 32)
+    mem.Write(CurrentCamera + OFF.camRot, AimRotBuf, 36)
+}
+
+; ----------------------------------------------------------------
+;  Memory reads
+; ----------------------------------------------------------------
+ReadPositionFast(primPtr) {
+    global mem, OFF, ReadPosBuf
+    if (!primPtr || primPtr < 0x10000) {
+        return ""
+    }
+    if (!DllCall("ReadProcessMemory", "Ptr", mem.hProcess, "Ptr", primPtr + OFF.ppos
+        , "Ptr", ReadPosBuf, "UPtr", 12, "Ptr", 0)) {
+        return ""
+    }
+    x := NumGet(ReadPosBuf, 0, "Float")
+    y := NumGet(ReadPosBuf, 4, "Float")
+    z := NumGet(ReadPosBuf, 8, "Float")
+    if (x = 0 && y = 0 && z = 0) {
+        return ""
+    }
+    if (Abs(x) > 1000000 || Abs(y) > 1000000 || Abs(z) > 1000000) {
+        return ""
+    }
+    return [x, y, z]
+}
+
+ResolveLocalPlayer() {
+    global
+    LocalCharPtr := 0, LocalPrimPtr := 0, LocalHumPtr := 0, LocalHeadPrim := 0
+    LocalPlayerPos := ""
+    if (!PlayersService) {
+        return
+    }
+    lp := mem.Read(PlayersService + OFF.lp, "Ptr")
+    if (!lp) {
+        return
+    }
+    LocalCharPtr := mem.Read(lp + OFF.char, "Ptr")
+    if (!LocalCharPtr) {
+        lpName := ReadDisplayName(lp)
+        for ent in EntityCache {
+            if (ent.name = lpName) {
+                LocalCharPtr := ent.char
+                LocalHumPtr := ent.hum
+                LocalPrimPtr := ent.prim
+                LocalHeadPrim := ent.headPrim
+                break
+            }
+        }
+    }
+    if (LocalCharPtr) {
+        if (!LocalHumPtr) {
+            LocalHumPtr := LocateHumanoid(LocalCharPtr)
+        }
+        if (LocalHumPtr && !LocalPrimPtr) {
+            LocalPrimPtr := ResolvePrim(LocalHumPtr, LocalCharPtr)
+        }
+        if (!LocalHeadPrim) {
+            LocalHeadPrim := ResolveHeadPrim(LocalCharPtr)
+        }
+        if (LocalPrimPtr) {
+            p := ReadPositionFast(LocalPrimPtr)
+            if (IsObject(p)) {
+                LocalPlayerPos := p
+            }
+        }
+    }
+}
+
+LocateHumanoid(charModel) {
+    global mem, OFF
+    children := GetChildren(charModel)
+    for child in children {
+        if (!child) {
+            continue
+        }
+        if (ReadInstanceName(child) = "Humanoid") {
+            return child
+        }
+    }
+    for child in children {
+        if (!child) {
+            continue
+        }
+        mh := mem.Read(child + OFF.mhp, "Float")
+        if (mh < 1 || mh > 100000) {
+            continue
+        }
+        hp := mem.Read(child + OFF.hp, "Float")
+        if (hp < 0 || hp > mh + 2) {
+            continue
+        }
+        root := mem.Read(child + OFF.hrp, "Ptr")
+        if (root && mem.Read(root + OFF.prim, "Ptr")) {
+            return child
+        }
+    }
+    return 0
+}
+
+; ----------------------------------------------------------------
+;  Projection
+; ----------------------------------------------------------------
+LoadViewMatrix(veAddr) {
+    global ViewM, mem, OFF
+    ViewM := []
+    mbuf := Buffer(64, 0)
+    if (!DllCall("ReadProcessMemory", "Ptr", mem.hProcess, "Ptr", veAddr + OFF.mat
+        , "Ptr", mbuf, "UPtr", 64, "Ptr", 0)) {
+        return false
+    }
+    hasData := false
+    Loop 16 {
+        v := NumGet(mbuf, (A_Index - 1) * 4, "Float")
+        ViewM.Push(v)
+        if (v != 0) {
+            hasData := true
+        }
+    }
+    return hasData
+}
+
+ProjectToScreen(px, py, pz, &sx, &sy) {
+    global ViewM, MatrixMode, ScreenW, ScreenH
+    if (MatrixMode = "ROW") {
+        w := ViewM[13] * px + ViewM[14] * py + ViewM[15] * pz + ViewM[16]
+        if (w < 0.1) {
+            return false
+        }
+        cx := (ViewM[1] * px + ViewM[2] * py + ViewM[3] * pz + ViewM[4]) / w
+        cy := (ViewM[5] * px + ViewM[6] * py + ViewM[7] * pz + ViewM[8]) / w
+    } else {
+        w := ViewM[4] * px + ViewM[8] * py + ViewM[12] * pz + ViewM[16]
+        if (w < 0.1) {
+            return false
+        }
+        cx := (ViewM[1] * px + ViewM[5] * py + ViewM[9] * pz + ViewM[13]) / w
+        cy := (ViewM[2] * px + ViewM[6] * py + ViewM[10] * pz + ViewM[14]) / w
+    }
+    sx := (cx + 1) * 0.5 * ScreenW
+    sy := (1 - cy) * 0.5 * ScreenH
+    return true
+}
+
+; ----------------------------------------------------------------
+;  Roblox instance tree
+; ----------------------------------------------------------------
+FindService(name) {
+    global DataModel
+    for child in GetChildren(DataModel) {
+        if (ReadInstanceName(child) = name) {
+            return child
+        }
+    }
+    return 0
+}
+
+GetChildren(instance) {
+    global mem, OFF
+    result := []
+    if (!instance) {
+        return result
+    }
+    p1 := mem.Read(instance + OFF.child, "Ptr")
+    if (!p1) {
+        return result
+    }
+    begin := 0, endp := 0
+    b := mem.Read(p1, "Ptr")
+    if (b) {
+        e := mem.Read(p1 + OFF.childEnd, "Ptr")
+        if (e && e > b && (e - b) <= 0x20000 && Mod(e - b, 8) = 0) {
+            begin := b, endp := e
+        }
+    }
+    if (!begin) {
+        e := mem.Read(instance + OFF.child + 0x8, "Ptr")
+        if (e && e > p1 && (e - p1) <= 0x20000 && Mod(e - p1, 8) = 0) {
+            begin := p1, endp := e
+        }
+    }
+    if (!begin) {
+        return result
+    }
+    count := (endp - begin) // 8
+    if (count > 3000) {
+        count := 3000
+    }
+    Loop count {
+        c := mem.Read(begin + (A_Index - 1) * 8, "Ptr")
+        if (c) {
+            result.Push(c)
+        }
+    }
+    return result
+}
+
+ReadInstanceName(instance) {
+    global mem, OFF
+    container := mem.Read(instance + OFF.nameC, "Ptr")
+    if (!container) {
+        return ""
+    }
+    s := ReadRobloxString(container + OFF.name, 64)
+    return (s = "") ? ReadRobloxString(container, 64) : s
+}
+
+ReadDisplayName(player) {
+    global mem, OFF
+    s := ReadRobloxString(player + OFF.disp, 32)
+    if (s = "") {
+        s := ReadInstanceName(player)
+    }
+    return (s = "") ? "?" : s
+}
+
+ReadRobloxString(addr, maxLen := 64) {
+    global mem
+    if (!addr) {
+        return ""
+    }
+    len := mem.Read(addr + 0x10, "UInt")
+    if (len = "" || len > maxLen) {
+        return ""
+    }
+    if (len <= 15) {
+        return mem.ReadString(addr, len)
+    }
+    dataPtr := mem.Read(addr, "Ptr")
+    if (!dataPtr) {
+        return ""
+    }
+    return mem.ReadString(dataPtr, len)
+}
+
+; ----------------------------------------------------------------
+;  Debug output
+; ----------------------------------------------------------------
+EntityReport() {
+    global
+    if (!RequireAttach()) {
+        MsgBox("Not attached")
+        return
+    }
+    out := "VORTEX Report`nTotal: " EntityCache.Length "`n`n"
+    nVis := 0, nOff := 0, nDead := 0
+    for i, ent in EntityCache {
+        if (ent.char = LocalCharPtr) {
+            out .= i ". " ent.name " — Local`n"
+            continue
+        }
+        if (!ent.hum || ent.hp <= 0.01) {
+            out .= i ". " ent.name " — Dead`n"
+            nDead++
+            continue
+        }
+        if (!ent.prim) {
+            out .= i ". " ent.name " — No pos`n"
+            continue
+        }
+        aim := GetAimPoint(ent)
+        if (!IsObject(aim)) {
+            out .= i ". " ent.name " — Stale`n"
+            continue
+        }
+        if (!ProjectToScreen(aim[1], aim[2], aim[3], &sx, &sy)) {
+            out .= i ". " ent.name " — Off-screen`n"
+            nOff++
+            continue
+        }
+        out .= i ". " ent.name " — Visible (head: " (ent.headPrim ? "yes" : "offset") ")`n"
+        nVis++
+    }
+    out .= "`nVis: " nVis " | Off: " nOff " | Dead: " nDead
+    Clipboard := out
+    MsgBox(out, "VORTEX")
+}
+
+DebugDump() {
+    global
+    if (!RequireAttach()) {
+        MsgBox("Not attached")
+        return
+    }
+    heads := 0
+    for ent in EntityCache {
+        if (ent.headPrim) {
+            heads++
+        }
+    }
+    m := "VORTEX`n`n"
+    m .= "Offsets: " OffsetSource "`n"
+    m .= "Matrix: " MatrixMode " (" (MatrixOK ? "OK" : "FAIL") ")`n"
+    m .= "Entities: " EntityCache.Length " (" heads " with real Head part)`n"
+    m .= "AimType: " AimType " | FOV: " AimbotFOV "`n"
+    m .= "X: " XSmooth " | Y: " YSmooth "`n"
+    m .= "Pred X: " PredX "ms | Pred Y: " PredY "ms`n"
+    m .= "Head ±: " HeadOffset " studs`n"
+    m .= "Sticky: " StickyTargetChar "`n"
+    MsgBox(m, "VORTEX")
+}
+
+; ----------------------------------------------------------------
+;  GDI wrappers
+; ----------------------------------------------------------------
+SetTransKey(hwnd) {
+    DllCall("user32\SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0x00FF00FF, "UInt", 0, "UInt", 1)
+}
+
+PositionOverlay(hwnd, x, y, w, h) {
+    DllCall("user32\SetWindowPos", "Ptr", hwnd, "Ptr", 0
+        , "Int", x, "Int", y, "Int", w, "Int", h, "UInt", 0x0010 | 0x0004)
+}
+
+OnNoErase(w, l, m, hwnd) {
+    global HwndOverlay
+    if (hwnd = HwndOverlay) {
+        return 1
+    }
+}
+
+OnOverlayPaint(w, l, m, hwnd) {
+    global HwndOverlay, hBBdc, BBw, BBh
+    if (hwnd != HwndOverlay || !hBBdc || BBw <= 0) {
+        return
+    }
+    hdc := DllCall("user32\GetDC", "Ptr", hwnd, "Ptr")
+    DllCall("gdi32\BitBlt", "Ptr", hdc, "Int", 0, "Int", 0, "Int", BBw, "Int", BBh
+        , "Ptr", hBBdc, "Int", 0, "Int", 0, "UInt", 0x00CC0020)
+    DllCall("user32\ReleaseDC", "Ptr", hwnd, "Ptr", hdc)
+    DllCall("user32\ValidateRect", "Ptr", hwnd, "Ptr", 0)
+    return 0
+}
+
+InitBackbuffer(w, h) {
+    global
+    if (hBBdc && w = BBw && h = BBh) {
+        return
+    }
+    if (hBBdc) {
+        DllCall("gdi32\DeleteObject", "Ptr", hBBbm, "Ptr")
+        DllCall("gdi32\DeleteDC", "Ptr", hBBdc, "Ptr")
+    }
+    hdcS := DllCall("user32\GetDC", "Ptr", HwndOverlay, "Ptr")
+    hBBdc := DllCall("gdi32\CreateCompatibleDC", "Ptr", hdcS, "Ptr")
+    hBBbm := DllCall("gdi32\CreateCompatibleBitmap", "Ptr", hdcS, "Int", w, "Int", h, "Ptr")
+    DllCall("user32\ReleaseDC", "Ptr", HwndOverlay, "Ptr", hdcS)
+    DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", hBBbm, "Ptr")
+    DllCall("gdi32\SelectObject", "Ptr", hBBdc, "Ptr", hFont, "Ptr")
+    FillRect(hBBdc, 0, 0, w, h, hBrushErase)
+    BBw := w, BBh := h
+}
+
+GetClientRect(hwnd) {
+    rc := Buffer(16, 0)
+    DllCall("user32\GetClientRect", "Ptr", hwnd, "Ptr", rc)
+    DllCall("user32\ClientToScreen", "Ptr", hwnd, "Ptr", rc)
+    return {x: NumGet(rc, 0, "Int"), y: NumGet(rc, 4, "Int")
+        , w: NumGet(rc, 8, "Int"), h: NumGet(rc, 12, "Int")}
+}
+
+FillRect(dc, x1, y1, x2, y2, brush) {
+    global FillRectBuf
+    NumPut("Int", Round(x1), FillRectBuf, 0)
+    NumPut("Int", Round(y1), FillRectBuf, 4)
+    NumPut("Int", Round(x2), FillRectBuf, 8)
+    NumPut("Int", Round(y2), FillRectBuf, 12)
+    DllCall("user32\FillRect", "Ptr", dc, "Ptr", FillRectBuf, "Ptr", brush)
+}
+
+DrawBox(dc, x1, y1, x2, y2, pen) {
+    oldP := DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr", pen, "Ptr")
+    oldB := DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr"
+        , DllCall("gdi32\GetStockObject", "Int", 5, "Ptr"), "Ptr")
+    DllCall("gdi32\Rectangle", "Ptr", dc, "Int", Round(x1), "Int", Round(y1)
+        , "Int", Round(x2), "Int", Round(y2))
+    DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr", oldB, "Ptr")
+    DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr", oldP, "Ptr")
+}
+
+DrawCornerBox(dc, x1, y1, x2, y2, pen) {
+    x1 := Round(x1), y1 := Round(y1), x2 := Round(x2), y2 := Round(y2)
+    cl := Max((x2 - x1) // 5, 4)
+    cw := Max((y2 - y1) // 5, 4)
+    old := DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr", pen, "Ptr")
+    DllCall("gdi32\MoveToEx", "Ptr", dc, "Int", x1, "Int", (y1 + cw), "Ptr", 0)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", x1, "Int", y1)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", (x1 + cl), "Int", y1)
+    DllCall("gdi32\MoveToEx", "Ptr", dc, "Int", (x2 - cl), "Int", y1, "Ptr", 0)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", x2, "Int", y1)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", x2, "Int", (y1 + cw))
+    DllCall("gdi32\MoveToEx", "Ptr", dc, "Int", x2, "Int", (y2 - cw), "Ptr", 0)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", x2, "Int", y2)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", (x2 - cl), "Int", y2)
+    DllCall("gdi32\MoveToEx", "Ptr", dc, "Int", (x1 + cl), "Int", y2, "Ptr", 0)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", x1, "Int", y2)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", x1, "Int", (y2 - cw))
+    DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr", old, "Ptr")
+}
+
+DrawLine(dc, x1, y1, x2, y2, pen) {
+    old := DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr", pen, "Ptr")
+    DllCall("gdi32\MoveToEx", "Ptr", dc, "Int", Round(x1), "Int", Round(y1), "Ptr", 0)
+    DllCall("gdi32\LineTo", "Ptr", dc, "Int", Round(x2), "Int", Round(y2))
+    DllCall("gdi32\SelectObject", "Ptr", dc, "Ptr", old, "Ptr")
+}
+
+DrawText(dc, text, x, y, color) {
+    DllCall("gdi32\SetTextColor", "Ptr", dc, "UInt", color)
+    DllCall("gdi32\SetBkMode", "Ptr", dc, "Int", 1)
+    DllCall("gdi32\TextOutA", "Ptr", dc, "Int", Round(x), "Int", Round(y)
+        , "AStr", text, "Int", StrLen(text))
+}
+
+; ----------------------------------------------------------------
+;  Process memory
+; ----------------------------------------------------------------
+class RobloxMemory {
+    __New(exeName) {
+        this.hProcess := 0
+        this.EnableDebugPrivilege()
+        try pid := ProcessExist(exeName)
+        if (!pid) {
+            return
+        }
+        this.PID := pid
+        this.hProcess := DllCall("OpenProcess", "UInt", 0x1F0FFF, "Int", 0, "UInt", pid, "Ptr")
+        if (this.hProcess) {
+            this.BaseAddress := this.GetModuleBase(exeName)
+        }
+    }
+
+    __Delete() {
+        if (this.hProcess && this.hProcess != -1) {
+            DllCall("CloseHandle", "Ptr", this.hProcess)
+        }
+    }
+
+    EnableDebugPrivilege() {
+        hToken := 0
+        DllCall("Advapi32\OpenProcessToken", "Ptr", -1, "UInt", 0x0020, "Ptr*", &hToken)
+        la := Buffer(12, 0), luid := 0
+        DllCall("Advapi32\LookupPrivilegeValue", "Ptr", 0, "Str", "SeDebugPrivilege", "Int64*", &luid)
+        NumPut("Int64", luid, la, 0)
+        NumPut("UInt", 2, la, 8)
+        tp := Buffer(16, 0), NumPut("UInt", 1, tp, 0)
+        DllCall("RtlMoveMemory", "Ptr", tp.ptr + 4, "Ptr", la.ptr, "UPtr", 12)
+        DllCall("Advapi32\AdjustTokenPrivileges", "Ptr", hToken, "Int", 0
+            , "Ptr", tp, "UInt", 0, "Ptr", 0, "Ptr", 0)
+        DllCall("CloseHandle", "Ptr", hToken)
+    }
+
+    GetModuleBase(moduleName) {
+        hSnap := DllCall("CreateToolhelp32Snapshot", "UInt", 0x00000018, "UInt", this.PID, "Ptr")
+        if (hSnap = -1 || !hSnap) {
+            return 0
+        }
+        sz := 1080
+        me32 := Buffer(sz, 0)
+        NumPut("UInt", sz, me32, 0)
+        if (DllCall("Module32First", "Ptr", hSnap, "Ptr", me32)) {
+            Loop {
+                if (StrGet(me32.ptr + 48, 256, "CP0") = moduleName) {
+                    modBase := NumGet(me32, 24, "Ptr")
+                    DllCall("CloseHandle", "Ptr", hSnap)
+                    return modBase
+                }
+            } Until !DllCall("Module32Next", "Ptr", hSnap, "Ptr", me32)
+        }
+        DllCall("CloseHandle", "Ptr", hSnap)
+        return 0
+    }
+
+    Read(addr, type := "Ptr") {
+        size := this.GetTypeSize(type)
+        buf := Buffer(size, 0)
+        DllCall("ReadProcessMemory", "Ptr", this.hProcess, "Ptr", addr, "Ptr", buf
+            , "UPtr", size, "Ptr", 0)
+        return NumGet(buf, 0, type)
+    }
+
+    Write(addr, buf, size) {
+        return DllCall("WriteProcessMemory", "Ptr", this.hProcess, "Ptr", addr
+            , "Ptr", buf, "UPtr", size, "Ptr", 0)
+    }
+
+    WriteValue(addr, val, type := "Float") {
+        size := this.GetTypeSize(type)
+        buf := Buffer(size, 0)
+        NumPut(type, val, buf, 0)
+        return DllCall("WriteProcessMemory", "Ptr", this.hProcess, "Ptr", addr
+            , "Ptr", buf, "UPtr", size, "Ptr", 0)
+    }
+
+    ReadString(addr, size) {
+        buf := Buffer(size + 1, 0)
+        DllCall("ReadProcessMemory", "Ptr", this.hProcess, "Ptr", addr, "Ptr", buf
+            , "UPtr", size, "Ptr", 0)
+        s := StrGet(buf, size, "CP0")
+        return RegExMatch(s, "[^\x20-\x7E]") ? "" : s
+    }
+
+    GetTypeSize(type) {
+        if (type = "Float" || type = "UInt" || type = "Int") {
+            return 4
+        }
+        if (type = "UChar" || type = "Char") {
+            return 1
+        }
+        if (type = "UShort" || type = "Short") {
+            return 2
+        }
+        return 8
+    }
+}
